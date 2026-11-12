@@ -6,12 +6,13 @@ import time
 import gradio as gr
 import numpy as np
 import pandas as pd
+from datasets import load_dataset
 
 from google import genai
 from google.genai import types
 from google.genai import errors
 
-# Fluxo RAG: indexação → retrieval (com query rewriting) → augmentation →
+# RAG flow: indexação → retrieval (com query rewriting) → augmentation →
 # geração → faithfulness check. Etapas marcadas como "RAG ·" abaixo.
 
 GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY")
@@ -21,10 +22,13 @@ if not GOOGLE_API_KEY:
         "(Settings → Repository Secrets) e reinicie o Space."
     )
 
+# Dataset público no HF Hub — não precisa de token para leitura.
+HF_DATASET = os.getenv("HF_DATASET", "lukinhapdm/corpus-rag-saude-itabira")
+
 client = genai.Client(api_key=GOOGLE_API_KEY)
 
 
-# Modelos
+# MODELOS
 # Blocklists separadas: "embedding" só bloqueia geradores, nunca embedders.
 BLOQUEIO_OBSOLETO_COMUM = ["gemini-2.0", "gemini-2.5", "gemini-1.5", "gemini-1.0"]
 BLOQUEIO_GERACAO   = BLOQUEIO_OBSOLETO_COMUM + ["embedding", "aqa", "imagen", "veo", "tts"]
@@ -94,62 +98,29 @@ print(f"[Gerador]    {model_name_geracao}")
 print(f"[Embedder]   {model_embeddings}")
 
 
-# Corpus
-DOCUMENTO1 = {"Título": "O que é o novo coronavírus, a Covid-19?",
-              "Conteúdo": "A COVID-19 é uma doença causada pelo coronavírus, denominado SARS-CoV-2, que apresenta um espectro clínico variando de infecções assintomáticas a quadros graves. De acordo com a Organização Mundial de Saúde, a maioria (cerca de 80%) dos pacientes com COVID-19 podem ser assintomáticos ou oligossintomáticos (poucos sintomas), e aproximadamente 20% dos casos detectados requer atendimento hospitalar por apresentarem dificuldade respiratória, dos quais aproximadamente 5% podem necessitar de suporte ventilatório. Fontes: Secretaria de Estado de Saúde de Minas Gerais e Organização Mundial de Saúde (OMS)."}
-DOCUMENTO2 = {"Título": "Quais são os sintomas mais comuns da Covid-19?",
-              "Conteúdo": "A COVID-19 (novo coronavírus) possui múltiplos sintomas, em que esses sintomas podem variar, sendo os mais comuns deles: resfriado, febre, sensação febril, tosse, coriza, dor de garganta, dor de cabeça, dificuldade para respirar, perda de olfato, alteração do paladar, náuseas, vômitos, diarreia, cansaço, diminuição do apetite e falta de ar. Fonte: Secretaria de Estado de Saúde de Minas Gerais."}
-DOCUMENTO3 = {"Título": "O que fazer caso esteja com sintomas?",
-              "Conteúdo": "Se você estiver doente, com sintomas compatíveis com a COVID-19, tais como febre, tosse, dor de garganta e/ou coriza, com ou sem falta de ar, evite contato físico com outras pessoas, incluindo os familiares, principalmente, idosos e doentes crônicos, procure imediatamente os postos de triagem nas Unidades Básica de Saúde (UBS) ou outras unidades de saúde. Fonte: Secretaria de Estado de Saúde de Minas Gerais."}
-DOCUMENTO4 = {"Título": "Grupos de risco da Covid-19",
-              "Conteúdo": "Alguns grupos têm maior chance de desenvolver as formas mais graves da doença covid-19, como: idosos (idade igual ou superior a 60 anos), pessoas com doenças cardíacas, pessoas com doenças pulmonares, como asma e Doença Pulmonar Obstrutiva Crônica, pessoas com problemas de baixa imunidade, como pessoas transplantadas ou em quimioterapia, pessoas com doenças renais ou em diálise, diabéticos, gestantes de alto risco, pessoas com doenças do fígado e obesos (IMC>=40). Fonte: Secretaria de Estado de Saúde de Minas Gerais."}
-DOCUMENTO5 = {"Título": "Bairros e Unidades de Saúde da Cidade de Itabira Separados por Região",
-              "Conteúdo": "Bairros da Região 1: Fênix, João XXIII, Valença, Monsenhor José Lopes, Santa Marta, Santa Ruth, Ribeira de Cima, Pedras do Vale, Jardim Belvedere, Bálsamos, Conceição, Vila Técnica Conceição, Abóboras, Barreiro, Condomínio Retiro da Serra, Cedro, Jardim Universitário, CDI I e CDI II. Unidades de Saúde da Região 1: UBS Fênix (3839-2489), UBS João XXIII (3839-2400), UBS Santa Marta (3839-2485), UBS Santa Ruth (3839-2485) e UBS Barreiro (3839-2788). Bairros da Região 2: Gabiroba, Ribeira de Baixo, Santa Tereza, Jardins dos Ipês, Bethânia, Fazenda do Lago, Flamboyant, Vale do Sol, Loteamento da Cohapi e Candidópolis. Unidades de Saúde da Região 2: UBS Bethânia (3839-2935), UBS Gabiroba de Baixo (3839-2491) e UBS Gabiroba de Cima (3839-2492). Bairros da Região 3: Amazonas, Novo Amazonas, Clóvis Alvim I, Clóvis Alvim II, Hamilton, Gianetti, Major Lage (Areão), Caminho Novo, São Tomé, São Bento, Cônego Guilhermino, Vila Dom Prudêncio, São Marcos, Panorama, Água Fresca, Vila Santa Bárbara, Vila Salica, Madre Maria de Jesus, Machado, Juca Batista e Loteamento José Leandro de Araújo. Unidades de Saúde da Região 3: UBS Amazonas (3839-2225), UBS Clóvis Alvim (3839-2165), UBS Major Lage (3839-2324), UBS Areão (3839-2482), UBS Água Fresca (3839-2222), UBS Machado (3839-2497) e UBS Juca Batista (3839-2495). Bairros da Região 4: Colina da Praia, Praia, Eldorado, São Francisco, Cidade Nova, Santa Inês, Santa Matilde, João Fortunato, Alvorada, Juca Rosa, Nossa Senhora das Oliveiras, São Cristóvão, Alta Vista, Belo Monte, Jardim Buritis, Jardim Belvedere, Jardim Mangabeiras, Condomínio Beleville, Condomínio Morada da Brisa e Condomínio Village da Lagoa. Unidades de Saúde da Região 4: UBS Praia I (3831-3819), UBS Praia II (3839-2224), UBS Eldorado (3839-2833), UBS Juca Rosa (3839-2496) e UBS Nossa Senhora das Oliveiras (3839-2574). Bairros da Região 5: Pedreira. Unidades de Saúde da Região 5: UBS Pedreira I (3839-2484) e UBS Pedreira II (3839-2583). Bairros da Região 6: Centro, Penha, Campestre, Bela Vista, Nova Vista, São Pedro, Vila Santa Izabel, Vila Santa Rosa, Vila Piedade, Esplanada da Estação, 14 de Fevereiro, Vila São Joaquim, Alto Pereira, Vila Amélia, Moinho Velho, Chacrinha, Vila Paciência, Vila das Nações Unidas, Santo Antônio e Pará. Unidades de Saúde da Região 6: Hospital Nossa Senhora das Dores (3839-1405), UBS Centro (3839-2488), UBS Campestre (3839-2487), UBS Bela Vista (3839-2486), UBS Nova Vista (3839-2499), UBS Vila Santa Rosa (3839-2494), UBS Vila Piedade (3839-2493) e UBS Pará (3839-2483). Bairros da Região 7: Chapada, Boa Esperança e Barro Branco. Unidades de Saúde da Região 7: UBS Chapada (3839-2927). Bairros da Região 8: Senhora do Carmo. Unidades de Saúde da Região 8: UBS Senhora do Carmo (3839-2766). Bairros da Região 9: Ipoema. Unidades de Saúde da Região 9: UBS Ipoema (3839-2780). Fontes: Secretaria Municipal de Saúde de Itabira e Prefeitura de Itabira."}
-documentos = [DOCUMENTO1, DOCUMENTO2, DOCUMENTO3, DOCUMENTO4, DOCUMENTO5]
+# CORPUS
+# RAG · indexação — o dataset já vem chunked (id, titulo, texto, fonte,
+# documento_origem). Como é público, load_dataset não exige autenticação.
+corpus = load_dataset(HF_DATASET, split="train")
+
+dataframe = corpus.to_pandas().rename(columns={
+    "id":     "Chunk_ID",
+    "titulo": "Titulo",
+    "texto":  "Conteudo",
+})
+
+# A coluna `fonte` é uma string separada por ", " — reconstruímos a lista
+# para o faithfulness check e para o cabeçalho de augmentação.
+dataframe["Fontes"] = dataframe["fonte"].apply(
+    lambda s: [f.strip() for f in str(s).split(", ") if f.strip()]
+)
+
+print(f"[Corpus] {len(dataframe)} chunks carregados de {HF_DATASET}")
 
 
-# Indexação
-# RAG · indexação — extrai rodapé "Fonte:/Fontes:" para citation grounding.
-def extrair_fontes(texto):
-    m = re.search(r"Fontes?:?\s*(.+?)(?:\.\s*$|$)", texto, re.I | re.S)
-    if not m: return []
-    bloco = m.group(1).strip().rstrip(".")
-    return [s.strip() for s in re.split(r"\s+e\s+", bloco) if len(s.strip()) > 8]
-
-# RAG · indexação — chunking com quebra em pontuação e overlap.
-def chunkar_texto(texto, max_chars=450, overlap_chars=80):
-    if len(texto) <= max_chars: return [texto]
-    chunks, inicio = [], 0
-    while inicio < len(texto):
-        fim = min(inicio + max_chars, len(texto))
-        if fim < len(texto):
-            janela = texto[max(inicio, fim - 100):fim]
-            corte = max(janela.rfind(". "), janela.rfind("! "), janela.rfind("? "))
-            if corte != -1:
-                fim = max(inicio, fim - 100) + corte + 1
-        chunks.append(texto[inicio:fim].strip())
-        if fim >= len(texto): break
-        inicio = fim - overlap_chars
-    return chunks
-
-def montar_base_chunks(documentos, max_chars=450, overlap=80):
-    registros = []
-    for doc_id, doc in enumerate(documentos):
-        fontes = extrair_fontes(doc["Conteúdo"])
-        for ch_id, ch in enumerate(chunkar_texto(doc["Conteúdo"], max_chars, overlap)):
-            registros.append({
-                "Titulo":   doc["Título"],
-                "Chunk_ID": f"d{doc_id}_c{ch_id}",
-                "Conteudo": ch,
-                "Fontes":   fontes,
-            })
-    return pd.DataFrame(registros)
-
-dataframe = montar_base_chunks(documentos)
-print(f"[Corpus] {len(dataframe)} chunks de {len(documentos)} documentos.")
-
-
-# RAG · indexação vetorial — task_type DOCUMENT para documentos.
+# INDEXAÇÃO VETORIAL
+# RAG · indexação vetorial — task_type DOCUMENT; `title` ancora semanticamente
+# cada chunk com o título do documento-pai.
 def funcao_embed(title, text):
     resp = client.models.embed_content(
         model=model_embeddings, contents=text,
@@ -162,8 +133,9 @@ dataframe["Embeddings"] = dataframe.apply(
 )
 
 
-# Retrieval
-# RAG · retrieval — task_type QUERY + top-k + threshold.
+# RETRIEVAL
+# RAG · retrieval — task_type QUERY + top-k + threshold. Sem contexto válido,
+# o loop do chat NÃO chama o LLM (evita alucinação por falta de grounding).
 def recuperar_contexto(consulta, top_k=3, threshold=0.30):
     resp = client.models.embed_content(
         model=model_embeddings, contents=consulta,
@@ -175,7 +147,8 @@ def recuperar_contexto(consulta, top_k=3, threshold=0.30):
 
     resultados = []
     for i in ordem:
-        if scores[i] < threshold: continue
+        if scores[i] < threshold:
+            continue
         resultados.append({
             "Titulo":   dataframe.iloc[i]["Titulo"],
             "Chunk_ID": dataframe.iloc[i]["Chunk_ID"],
@@ -186,19 +159,20 @@ def recuperar_contexto(consulta, top_k=3, threshold=0.30):
     return resultados
 
 
-# Resiliência
+# RESILIÊNCIA
 # Backoff exponencial + jitter para ServerError (503).
 def chamar_api_com_retentativa(funcao, *args, tentativas=5, base=2.0, cap=30.0, **kwargs):
     for n in range(tentativas):
         try:
             return funcao(*args, **kwargs)
         except errors.ServerError:
-            if n == tentativas - 1: raise
+            if n == tentativas - 1:
+                raise
             delay = min(cap, base * (2 ** n)) + random.uniform(0, 1)
             time.sleep(delay)
 
 
-# Safety e prompt de sistema
+# SAFETY E PROMPT DO SISTEMA
 seguranca_config = [
     types.SafetySetting(category=types.HarmCategory.HARM_CATEGORY_HARASSMENT,
                         threshold=types.HarmBlockThreshold.BLOCK_MEDIUM_AND_ABOVE),
@@ -210,7 +184,8 @@ seguranca_config = [
                         threshold=types.HarmBlockThreshold.BLOCK_MEDIUM_AND_ABOVE),
 ]
 
-# RAG · generation — few-shot + grounding + regra de citação (só de "Fontes:").
+# RAG · generation — few-shot + grounding restritivo + regra de citação (só copia
+# do campo "Fontes:" do cabeçalho; nunca infere a partir do conteúdo).
 instrucao_sistema = """
 Utilizando como base os exemplos de perguntas e respostas abaixo, responda à pergunta atual utilizando o texto base num formato organizado, separando as informações em tópicos para destaque, incluindo as fontes do texto base, mas sem adicionar informações que não fazem parte do texto base.
 
@@ -228,7 +203,7 @@ EXEMPLO DE RESPOSTA 1:
   * ~80% assintomáticos ou oligossintomáticos.
   * ~20% requerem hospitalização.
   * ~5% dos hospitalizados necessitam de suporte ventilatório.
-* **Fontes:** Secretaria de Estado de Saúde de Minas Gerais e Organização Mundial de Saúde (OMS).
+* **Fontes:** Secretaria de Estado de Saúde de Minas Gerais, Organização Mundial de Saúde (OMS).
 
 EXEMPLO DE PERGUNTA 2: Quais são as UBS perto do bairro São Bento?
 EXEMPLO DE RESPOSTA 2:
@@ -241,7 +216,7 @@ EXEMPLO DE RESPOSTA 2:
   * UBS Água Fresca (3839-2222)
   * UBS Machado (3839-2497)
   * UBS Juca Batista (3839-2495)
-* **Fontes:** Secretaria Municipal de Saúde de Itabira e Prefeitura de Itabira.
+* **Fontes:** Secretaria Municipal de Saúde de Itabira, Prefeitura de Itabira.
 """
 
 config_geracao = types.GenerateContentConfig(
@@ -250,10 +225,12 @@ config_geracao = types.GenerateContentConfig(
 )
 
 
-# Query rewriting
-# RAG · retrieval — consulta autocontida a partir do histórico.
+# QUERY REWRITING
+# RAG · retrieval — reescreve a pergunta como consulta autocontida a partir do
+# histórico; fallback silencioso para a pergunta original em qualquer falha.
 def reformular_consulta(pergunta, historico_txt):
-    if not historico_txt: return pergunta
+    if not historico_txt:
+        return pergunta
     contexto = "\n".join(historico_txt[-6:])
     prompt = (
         "Reescreva a NOVA PERGUNTA como uma consulta AUTOCONTIDA, "
@@ -273,8 +250,11 @@ def reformular_consulta(pergunta, historico_txt):
         return pergunta
 
 
-# Faithfulness (pós-geração)
-# RAG · pós-geração — telefones (contra chunks), fontes e títulos (contra metadado).
+# FAITHFULNESS
+# RAG · pós-geração — checagens ortogonais:
+#   (a) telefones: contra os chunks recuperados (o que o modelo viu);
+#   (b) fontes: contra o CONJUNTO de fontes dos documentos recuperados;
+#   (c) título citado como fonte: vira aviso, não erro.
 def verificar_faithfulness(resposta, contexto_chunks, fontes_esperadas, titulos_esperados):
     alertas, avisos = [], []
 
@@ -288,9 +268,10 @@ def verificar_faithfulness(resposta, contexto_chunks, fontes_esperadas, titulos_
     blocos = re.findall(r"Fontes?:?\s*\**\s*([^.\n]+)", resposta, re.I)
     for bloco in blocos:
         bloco = re.sub(r"\*+", "", bloco).strip()
-        for f in re.split(r"\s+e\s+|;", bloco):
+        for f in re.split(r"\s+e\s+|,|;", bloco):
             f = f.strip().rstrip(".")
-            if len(f) < 8: continue
+            if len(f) < 8:
+                continue
 
             if any(f.lower() in t.lower() or t.lower() in f.lower()
                    for t in titulos_esperados):
@@ -306,13 +287,13 @@ def verificar_faithfulness(resposta, contexto_chunks, fontes_esperadas, titulos_
     return alertas, avisos
 
 
-# Interface Gradio
+# INTERFACE GRADIO
 def chat_fn(message: str, history: list[dict]):
-    # RAG · retrieval — (0) reformula a partir do histórico textual.
+    # RAG · retrieval — (0) reformula com base no histórico textual.
     historico_txt = [f"{m['role']}: {m['content']}" for m in history[-6:]]
     consulta = reformular_consulta(message, historico_txt)
 
-    # RAG · retrieval — (1) top-k + threshold.
+    # RAG · retrieval — (1) top-k + threshold; sem resultado, não chama o LLM.
     resultados = recuperar_contexto(consulta)
     if not resultados:
         yield "Não encontrei informação relevante na base para responder com segurança."
@@ -331,6 +312,17 @@ def chat_fn(message: str, history: list[dict]):
         model=model_name_geracao, contents=prompt, config=config_geracao,
     )
     texto = resposta.text or ""
+
+    # RAG · pós-geração — (4) checagens de faithfulness.
+    titulos_esperados = list({r["Titulo"] for r in resultados})
+    fontes_esperadas  = sorted({f for r in resultados for f in r["Fontes"]})
+    alertas, avisos = verificar_faithfulness(
+        texto, contexto, fontes_esperadas, titulos_esperados,
+    )
+    if alertas:
+        texto += "\n\n> ⚠️ **Alerta de faithfulness:** " + "; ".join(alertas)
+    if avisos:
+        texto += "\n\n> ℹ️ " + "; ".join(avisos)
 
     # Streaming token a token via yield.
     parcial = ""
@@ -353,6 +345,7 @@ demo = gr.ChatInterface(
         "Estou no Centro, quais UBS ficam perto?",
         "Quem são os grupos de risco?",
         "Quais UBS ficam no bairro São Bento?",
+        "Qual o telefone da UBS Bethânia?",
     ],
     theme="soft",
     api_name="chat",
