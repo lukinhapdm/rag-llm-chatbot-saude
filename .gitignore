@@ -1,25 +1,50 @@
-# Ambientes e credenciais
-.env
-.env.*
-*.key
-secrets.json
-
 # Python
 __pycache__/
 *.py[cod]
+*.so
+build/
+dist/
 *.egg-info/
 .venv/
 venv/
-.pytest_cache/
-.mypy_cache/
+env/
+
+# Credenciais — nunca commitar
+.env
+.env.*
+secrets.json
+*.key
+
+# Gradio (runtime)
+.gradio/
+gradio_cached_examples/
+flagged/
+
+# Hugging Face (runtime)
+.cache/
+.huggingface/
 
 # Jupyter
 .ipynb_checkpoints/
 
-# Sistema operacional
+# IDEs
+.vscode/
+.idea/
+*.swp
+
+# SO
 .DS_Store
 Thumbs.db
 
-# IDE
-.vscode/
-.idea/
+# Logs e temporários
+*.log
+logs/
+tmp/
+temp/
+
+# Testes e lint
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
