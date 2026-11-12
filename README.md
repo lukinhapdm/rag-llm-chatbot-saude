@@ -12,44 +12,44 @@ license: mit
 
 # RAG Chatbot Saúde Itabira
 
-Protótipo de chatbot com **RAG (Retrieval-Augmented Generation)** e **LLM**
-sobre informações de COVID-19 e unidades de saúde da cidade de Itabira/MG.
+Prototype chatbot with **RAG (Retrieval-Augmented Generation)** and **LLM**
+over information about COVID-19 and healthcare units in the city of Itabira/MG.
 
-O corpus é carregado de um dataset público no Hugging Face Hub
-(`HF_DATASET`), já fragmentado em chunks com metadados de fonte. O app não
-contém textos hardcoded — atualizar o corpus é só regenerar o JSONL e fazer
-`push_to_hub` no dataset.
+The corpus is loaded from a public dataset on Hugging Face Hub
+(`HF_DATASET`), already split into chunks with source metadata. The app
+contains no hardcoded texts — updating the corpus only requires regenerating
+the JSONL and running `push_to_hub` on the dataset.
 
-## Como funciona
+## How it works
 
-1. **Indexação** — os chunks do dataset são vetorizados com
+1. **Indexing** — the dataset chunks are vectorized with
    `gemini-embedding-001` (task_type `RETRIEVAL_DOCUMENT`).
-2. **Retrieval** — a pergunta (eventualmente reescrita para se tornar
-   autocontida) é vetorizada com `RETRIEVAL_QUERY`; top-k por similaridade
-   de cosseno com corte de score.
-3. **Augmentation** — o contexto recuperado é injetado no prompt com
-   metadados de fonte e score.
-4. **Generation** — Gemini Flash gera a resposta com grounding restritivo
-   e regra explícita de citação.
-5. **Pós-geração** — checagem de *faithfulness*: telefones e fontes com
-   lastro no contexto recuperado.
+2. **Retrieval** — the question (possibly rewritten to become
+   self-contained) is vectorized with `RETRIEVAL_QUERY`; top-k by cosine
+   similarity with a score cutoff.
+3. **Augmentation** — the retrieved context is injected into the prompt with
+   source metadata and score.
+4. **Generation** — Gemini Flash generates the answer with restrictive
+   grounding and an explicit citation rule.
+5. **Post-generation** — *faithfulness* check: phone numbers and sources
+   grounded in the retrieved context.
 
 ## Dataset
 
-O corpus fica em um repositório separado no HF Hub
-(`lukinhapdm/corpus-rag-saude-itabira`). Para apontar para outro dataset,
-configure a variável `HF_DATASET` no Space.
+The corpus lives in a separate repository on HF Hub
+(`lukinhapdm/corpus-rag-saude-itabira`). To point to another dataset,
+set the `HF_DATASET` variable in the Space.
 
-## Limitações
+## Limitations
 
-- **Protótipo com finalidade educacional.** Não utilizar para decisões
-  clínicas ou em situações reais de saúde.
-- Corpus pequeno (5 documentos, ~14 chunks). Em produção, exige chunking
-  mais sofisticado, reranking e avaliação quantitativa (RAGAS).
+- **Educational prototype.** Do not use for clinical decisions or in real
+  healthcare situations.
+- Small corpus (5 documents, ~14 chunks). In production, it requires more
+  sophisticated chunking, reranking, and quantitative evaluation (RAGAS).
 
 ## Stack
 
-- [Gradio](https://gradio.app) — interface de chat
-- [google-genai](https://ai.google.dev/gemini-api/docs) — SDK unificado Gemini
-- [datasets](https://huggingface.co/docs/datasets) — carregamento do corpus
-- Hugging Face Spaces — hospedagem (ZeroGPU, tier gratuito)
+- [Gradio](https://gradio.app) — chat interface
+- [google-genai](https://ai.google.dev/gemini-api/docs) — unified Gemini SDK
+- [datasets](https://huggingface.co/docs/datasets) — corpus loading
+- Hugging Face Spaces — hosting (ZeroGPU, free tier) - COMING SOON
