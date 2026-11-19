@@ -5,7 +5,6 @@ generation (streaming) -> faithfulness check.
 
 The code and comments are in English; everything the end user sees
 (knowledge base, system instruction, prompts and UI) is in Portuguese.
-Comments marked with 🧠 point out where each AI concept is applied.
 """
 
 import os
@@ -33,19 +32,19 @@ if not GOOGLE_API_KEY:
 
 HF_DATASET = os.getenv("HF_DATASET", "lukinhapdm/corpus-rag-saude-itabira")
 
-# 🧠 Embedding models: the first one available is used for both indexing and queries
+# Embedding models: the first one available is used for both indexing and queries
 EMBEDDING_MODELS = ["models/gemini-embedding-001"]
 
-# 🧠 Generative LLMs: preference order used for fallback when a model is overloaded or retired
+# Generative LLMs: preference order used for fallback when a model is overloaded or retired
 GENERATION_MODELS = os.getenv(
     "GENERATION_MODELS",
     "models/gemini-3.5-flash-lite,models/gemini-3.1-flash-lite,models/gemini-3.5-flash,"
     "models/gemini-3.8-flash,models/gemini-3.6-flash,models/gemini-3.7-flash",
 ).split(",")
 
-TOP_K = 3  # 🧠 Top-k retrieval: number of chunks that may be injected into the prompt
-SIMILARITY_THRESHOLD = float(os.getenv("SIMILARITY_THRESHOLD", "0.55"))  # 🧠 Relevance threshold: minimum cosine similarity
-MAX_HISTORY_MESSAGES = 6  # 🧠 Context window: previous messages used as conversation memory
+TOP_K = 3  # Top-k retrieval: number of chunks that may be injected into the prompt
+SIMILARITY_THRESHOLD = float(os.getenv("SIMILARITY_THRESHOLD", "0.55"))  # Relevance threshold: minimum cosine similarity
+MAX_HISTORY_MESSAGES = 6  # Context window: previous messages used as conversation memory
 
 MAX_RETRIES = 3
 INITIAL_BACKOFF_S = 2.0
@@ -95,7 +94,7 @@ print(f"[Generation models] {ACTIVE_MODELS}")
 # KNOWLEDGE BASE
 
 
-# 🧠 Knowledge base: corpus already split into chunks (id, titulo, texto, fonte, documento_origem)
+# Knowledge base: corpus already split into chunks (id, titulo, texto, fonte, documento_origem)
 corpus = load_dataset(HF_DATASET, split="train").to_pandas()
 corpus["fontes"] = corpus["fonte"].apply(lambda s: [f.strip() for f in str(s).split(", ") if f.strip()])
 print(f"[Corpus] {len(corpus)} chunks loaded from {HF_DATASET}")
@@ -109,14 +108,14 @@ def embed_text(text, task_type, title=None):
         client.models.embed_content,
         model=EMBEDDING_MODEL,
         contents=text,
-        config=types.EmbedContentConfig(task_type=task_type, title=title),  # 🧠 Asymmetric embedding: different task types for documents and queries
+        config=types.EmbedContentConfig(task_type=task_type, title=title),  # Asymmetric embedding: different task types for documents and queries
     )
     vector = np.asarray(response.embeddings[0].values, dtype=np.float32)
-    return vector / np.linalg.norm(vector)  # 🧠 L2 normalization: the dot product becomes cosine similarity
+    return vector / np.linalg.norm(vector)  # L2 normalization: the dot product becomes cosine similarity
 
 
-EMBEDDING_MATRIX = np.stack([  # 🧠 Indexing: the corpus becomes a vector index (chunks x dimensions)
-    embed_text(row.texto, "RETRIEVAL_DOCUMENT", title=row.titulo)  # 🧠 The parent document title anchors each chunk semantically
+EMBEDDING_MATRIX = np.stack([  # Indexing: the corpus becomes a vector index (chunks x dimensions)
+    embed_text(row.texto, "RETRIEVAL_DOCUMENT", title=row.titulo)  # The parent document title anchors each chunk semantically
     for row in corpus.itertuples()
 ])
 print(f"[Index] {EMBEDDING_MATRIX.shape[0]} vectors of {EMBEDDING_MATRIX.shape[1]} dimensions")
@@ -126,8 +125,8 @@ print(f"[Index] {EMBEDDING_MATRIX.shape[0]} vectors of {EMBEDDING_MATRIX.shape[1
 
 
 def retrieve_context(query):
-    scores = EMBEDDING_MATRIX @ embed_text(query, "RETRIEVAL_QUERY")  # 🧠 Vector search: compares the query with every chunk
-    ranking = np.argsort(scores)[::-1][:TOP_K]  # 🧠 Top-k retrieval: the most similar chunks first
+    scores = EMBEDDING_MATRIX @ embed_text(query, "RETRIEVAL_QUERY")  # Vector search: compares the query with every chunk
+    ranking = np.argsort(scores)[::-1][:TOP_K]  # Top-k retrieval: the most similar chunks first
 
     print(f"[Retrieval] '{query}' -> " + ", ".join(f"{corpus.iloc[i]['id']}={scores[i]:.3f}" for i in ranking))
 
@@ -140,14 +139,14 @@ def retrieve_context(query):
             "score": float(scores[i]),
         }
         for i in ranking
-        if scores[i] >= SIMILARITY_THRESHOLD  # 🧠 Relevance threshold: discards unrelated context
+        if scores[i] >= SIMILARITY_THRESHOLD  # Relevance threshold: discards unrelated context
     ]
 
 
 # GENERATION SETTINGS
 
 
-SAFETY_SETTINGS = [  # 🧠 Safety filters: block harmful content with medium or high probability
+SAFETY_SETTINGS = [  # Safety filters: block harmful content with medium or high probability
     types.SafetySetting(category=category, threshold=types.HarmBlockThreshold.BLOCK_MEDIUM_AND_ABOVE)
     for category in (
         types.HarmCategory.HARM_CATEGORY_HARASSMENT,
@@ -157,7 +156,7 @@ SAFETY_SETTINGS = [  # 🧠 Safety filters: block harmful content with medium or
     )
 ]
 
-# 🧠 System instruction + few-shot prompting + restrictive grounding + citation rule (sources copied only from the "Fontes:" header)
+# System instruction + few-shot prompting + restrictive grounding + citation rule (sources copied only from the "Fontes:" header)
 SYSTEM_INSTRUCTION = """
 Utilizando como base os exemplos de perguntas e respostas abaixo, responda à pergunta atual utilizando o texto base num formato organizado, separando as informações em tópicos para destaque, incluindo as fontes do texto base, mas sem adicionar informações que não fazem parte do texto base.
 
@@ -192,15 +191,15 @@ EXEMPLO DE RESPOSTA 2:
 """
 
 GENERATION_CONFIG = types.GenerateContentConfig(
-    temperature=0.5,  # 🧠 Temperature: controls randomness when choosing each token
-    top_p=0.9,  # 🧠 Nucleus sampling: samples only from tokens adding up to 90% probability
+    temperature=0.5,  # Temperature: controls randomness when choosing each token
+    top_p=0.9,  # Nucleus sampling: samples only from tokens adding up to 90% probability
     max_output_tokens=2048,
     safety_settings=SAFETY_SETTINGS,
     system_instruction=SYSTEM_INSTRUCTION,
 )
 
 REWRITE_CONFIG = types.GenerateContentConfig(
-    temperature=0.0,  # 🧠 Deterministic decoding: rewriting must be faithful, not creative
+    temperature=0.0,  # Deterministic decoding: rewriting must be faithful, not creative
     max_output_tokens=256,
     safety_settings=SAFETY_SETTINGS,
 )
@@ -234,7 +233,7 @@ def convert_history(gradio_history):
                 parts=[types.Part(text=text)],
             ))
 
-    messages = messages[-MAX_HISTORY_MESSAGES:]  # 🧠 Short-term memory: a sliding window caps the tokens sent
+    messages = messages[-MAX_HISTORY_MESSAGES:]  # Short-term memory: a sliding window caps the tokens sent
     while messages and messages[0].role == "model":
         messages.pop(0)
     return messages
@@ -248,7 +247,7 @@ def rewrite_query(question, history):
         return question
 
     transcript = "\n".join(f"{m.role}: {m.parts[0].text}" for m in history)
-    prompt = (  # 🧠 Query rewriting: turns follow-ups ("e o telefone?") into self-contained search queries
+    prompt = (  # Query rewriting: turns follow-ups ("e o telefone?") into self-contained search queries
         "Reescreva a NOVA PERGUNTA como uma consulta AUTOCONTIDA, "
         "substituindo pronomes e referências implícitas por termos explícitos. "
         "Responda APENAS a consulta reescrita.\n\n"
@@ -273,7 +272,7 @@ def stream_answer(contents):
         for attempt in range(1, MAX_RETRIES + 1):
             partial = ""
             try:
-                stream = client.models.generate_content_stream(  # 🧠 LLM inference: autoregressive generation streamed token by token
+                stream = client.models.generate_content_stream(  # LLM inference: autoregressive generation streamed token by token
                     model=model, contents=contents, config=GENERATION_CONFIG,
                 )
                 for chunk in stream:
@@ -298,7 +297,7 @@ def stream_answer(contents):
 PHONE_PATTERN = r"\b\d{4}-\d{4}\b"
 
 
-def check_faithfulness(answer, context, expected_sources, expected_titles):  # 🧠 Faithfulness check: post-generation hallucination detection
+def check_faithfulness(answer, context, expected_sources, expected_titles):  # Faithfulness check: post-generation hallucination detection
     alerts, notices = [], []
 
     orphan_phones = set(re.findall(PHONE_PATTERN, answer)) - set(re.findall(PHONE_PATTERN, context))
@@ -344,22 +343,22 @@ def chat_fn(message, history):
         memory = convert_history(history)
         query = rewrite_query(question, memory)
 
-        results = retrieve_context(query)  # 🧠 RAG, retrieval: finds the most relevant chunks
+        results = retrieve_context(query)  # RAG, retrieval: finds the most relevant chunks
         if not results:
             yield NO_CONTEXT_MESSAGE  # without grounding the LLM is not called, which prevents hallucination
             return
 
-        context = "\n\n".join(  # 🧠 RAG, augmentation: each chunk goes in with its real sources and score
+        context = "\n\n".join(  # RAG, augmentation: each chunk goes in with its real sources and score
             f"[Documento: {r['title']} | Fontes: {', '.join(r['sources']) or 'não informada'} | Score: {r['score']:.3f}]\n{r['content']}"
             for r in results
         )
         prompt = f"PERGUNTA ATUAL: {question}\n\nTEXTO BASE:\n{context}"
 
         answer = ""
-        for answer in stream_answer(memory + [types.Content(role="user", parts=[types.Part(text=prompt)])]):  # 🧠 RAG, generation: memory + grounded prompt
+        for answer in stream_answer(memory + [types.Content(role="user", parts=[types.Part(text=prompt)])]):  # RAG, generation: memory + grounded prompt
             yield answer
         if not answer:
-            yield EMPTY_ANSWER_MESSAGE  # 🧠 Empty text means the safety filters blocked the answer
+            yield EMPTY_ANSWER_MESSAGE  # Empty text means the safety filters blocked the answer
             return
 
         alerts, notices = check_faithfulness(
@@ -381,7 +380,7 @@ def chat_fn(message, history):
 # USER INTERFACE
 
 
-demo = gr.ChatInterface(  # 🧠 Conversational interface: keeps the history and feeds it to the RAG pipeline on every turn
+demo = gr.ChatInterface(  # Conversational interface: keeps the history and feeds it to the RAG pipeline on every turn
     fn=chat_fn,
     title="🩺 Assistente RAG — Saúde Pública (Itabira/MG)",
     description=(
