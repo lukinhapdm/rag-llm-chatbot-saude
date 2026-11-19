@@ -1,192 +1,164 @@
+"""RAG chatbot about Covid-19 and the healthcare network of Itabira (MG, Brazil).
+
+Pipeline: indexing -> query rewriting -> retrieval -> augmentation ->
+generation (streaming) -> faithfulness check.
+
+The code and comments are in English; everything the end user sees
+(knowledge base, system instruction, prompts and UI) is in Portuguese.
+Comments marked with 🧠 point out where each AI concept is applied.
+"""
+
 import os
-import re
 import random
+import re
 import time
 
 import gradio as gr
 import numpy as np
-import pandas as pd
 from datasets import load_dataset
-
 from google import genai
-from google.genai import types
-from google.genai import errors
+from google.genai import errors, types
 
-# RAG flow: indexação → retrieval (com query rewriting) → augmentation →
-# geração → faithfulness check. Etapas marcadas como "RAG ·" abaixo.
+
+# CONFIGURATION
+# Values can be overridden with Space variables (Settings -> Variables).
+
 
 GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY")
 if not GOOGLE_API_KEY:
-    raise gr.Error(
-        "GOOGLE_API_KEY não configurada. Adicione como Secret no Space "
-        "(Settings → Repository Secrets) e reinicie o Space."
+    raise RuntimeError(
+        "GOOGLE_API_KEY is not set. Add it as a Secret in the Space "
+        "(Settings -> Variables and secrets) and restart the Space."
     )
 
-# Dataset público no HF Hub — não precisa de token para leitura.
 HF_DATASET = os.getenv("HF_DATASET", "lukinhapdm/corpus-rag-saude-itabira")
+
+# 🧠 Embedding models: the first one available is used for both indexing and queries
+EMBEDDING_MODELS = ["models/gemini-embedding-001"]
+
+# 🧠 Generative LLMs: preference order used for fallback when a model is overloaded or retired
+GENERATION_MODELS = os.getenv(
+    "GENERATION_MODELS",
+    "models/gemini-3.5-flash-lite,models/gemini-3.1-flash-lite,models/gemini-3.5-flash,"
+    "models/gemini-3.8-flash,models/gemini-3.6-flash,models/gemini-3.7-flash",
+).split(",")
+
+TOP_K = 3  # 🧠 Top-k retrieval: number of chunks that may be injected into the prompt
+SIMILARITY_THRESHOLD = float(os.getenv("SIMILARITY_THRESHOLD", "0.55"))  # 🧠 Relevance threshold: minimum cosine similarity
+MAX_HISTORY_MESSAGES = 6  # 🧠 Context window: previous messages used as conversation memory
+
+MAX_RETRIES = 3
+INITIAL_BACKOFF_S = 2.0
+TRANSIENT_ERROR_CODES = {429, 500, 503, 504}
+SKIP_MODEL_ERROR_CODES = {404}  # model listed by the API but no longer served
 
 client = genai.Client(api_key=GOOGLE_API_KEY)
 
 
-# MODELOS
-# Blocklists separadas: "embedding" só bloqueia geradores, nunca embedders.
-BLOQUEIO_OBSOLETO_COMUM = ["gemini-2.0", "gemini-2.5", "gemini-1.5", "gemini-1.0"]
-BLOQUEIO_GERACAO   = BLOQUEIO_OBSOLETO_COMUM + ["embedding", "aqa", "imagen", "veo", "tts"]
-BLOQUEIO_EMBEDDING = BLOQUEIO_OBSOLETO_COMUM + ["aqa", "imagen", "veo", "tts"]
-
-PREFERENCIAS_GERACAO   = ["gemini-3.5-flash-lite", "gemini-3.1-flash-lite",
-                          "gemini-3.5-flash", "gemini-3.8-flash",
-                          "gemini-3.6-flash", "gemini-3.7-flash"]
-PREFERENCIAS_EMBEDDING = ["gemini-embedding-001", "embedding-001", "embedding"]
-
-def _bloqueado(nome, bloquear):
-    n = nome.lower()
-    return any(b in n for b in bloquear)
-
-def listar_candidatos(preferencias, disponiveis, bloquear):
-    # Preferências primeiro, demais não bloqueados depois.
-    candidatos, vistos = [], set()
-    for pref in preferencias:
-        for nome in disponiveis:
-            if pref in nome and not _bloqueado(nome, bloquear) and nome not in vistos:
-                candidatos.append(nome); vistos.add(nome)
-    for nome in disponiveis:
-        if not _bloqueado(nome, bloquear) and nome not in vistos:
-            candidatos.append(nome); vistos.add(nome)
-    return candidatos
-
-# Separa o catálogo por capability.
-todos_geracao, todos_embedding = [], []
-for m in client.models.list():
-    acoes = getattr(m, "supported_actions", []) or []
-    if "generateContent" in acoes: todos_geracao.append(m.name)
-    if "embedContent"   in acoes: todos_embedding.append(m.name)
-
-if not todos_embedding:
-    raise RuntimeError(
-        "Nenhum modelo de embedding na API. Verifique a chave em "
-        "https://ai.google.dev/gemini-api/docs/models"
-    )
-
-candidatos_geracao   = listar_candidatos(PREFERENCIAS_GERACAO,   todos_geracao,   BLOQUEIO_GERACAO)
-candidatos_embedding = listar_candidatos(PREFERENCIAS_EMBEDDING, todos_embedding, BLOQUEIO_EMBEDDING)
-
-if not candidatos_geracao:
-    raise RuntimeError(f"Nenhum gerador ativo. API retornou: {todos_geracao}")
-
-# Valida em runtime e faz failover em 404 (modelos "zumbis" da API).
-def validar_geracao(nome):
-    try:
-        client.models.generate_content(
-            model=nome, contents="ping",
-            config=types.GenerateContentConfig(max_output_tokens=1, temperature=0.0),
-        )
-        return True
-    except errors.ClientError as e:
-        if getattr(e, "status_code", None) == 404 or "404" in str(e):
-            return False
-        raise
-    except Exception:
-        return False
-
-model_name_geracao = next((c for c in candidatos_geracao if validar_geracao(c)), None)
-if not model_name_geracao:
-    raise RuntimeError("Nenhum gerador respondeu ao teste de validação.")
-
-model_embeddings = candidatos_embedding[0]
-print(f"[Gerador]    {model_name_geracao}")
-print(f"[Embedder]   {model_embeddings}")
+# RESILIENCE
 
 
-# CORPUS
-# RAG · indexação — o dataset já vem chunked (id, titulo, texto, fonte,
-# documento_origem). Como é público, load_dataset não exige autenticação.
-corpus = load_dataset(HF_DATASET, split="train")
-
-dataframe = corpus.to_pandas().rename(columns={
-    "id":     "Chunk_ID",
-    "titulo": "Titulo",
-    "texto":  "Conteudo",
-})
-
-# A coluna `fonte` é uma string separada por ", " — reconstruímos a lista
-# para o faithfulness check e para o cabeçalho de augmentação.
-dataframe["Fontes"] = dataframe["fonte"].apply(
-    lambda s: [f.strip() for f in str(s).split(", ") if f.strip()]
-)
-
-print(f"[Corpus] {len(dataframe)} chunks carregados de {HF_DATASET}")
+def backoff_delay(attempt):
+    return INITIAL_BACKOFF_S * 2 ** (attempt - 1) + random.uniform(0, 1)
 
 
-# INDEXAÇÃO VETORIAL
-# RAG · indexação vetorial — task_type DOCUMENT; `title` ancora semanticamente
-# cada chunk com o título do documento-pai.
-def funcao_embed(title, text):
-    resp = client.models.embed_content(
-        model=model_embeddings, contents=text,
-        config=types.EmbedContentConfig(task_type="RETRIEVAL_DOCUMENT", title=title),
-    )
-    return resp.embeddings[0].values
-
-dataframe["Embeddings"] = dataframe.apply(
-    lambda row: funcao_embed(row["Titulo"], row["Conteudo"]), axis=1
-)
-
-
-# RETRIEVAL
-# RAG · retrieval — task_type QUERY + top-k + threshold. Sem contexto válido,
-# o loop do chat NÃO chama o LLM (evita alucinação por falta de grounding).
-def recuperar_contexto(consulta, top_k=3, threshold=0.30):
-    resp = client.models.embed_content(
-        model=model_embeddings, contents=consulta,
-        config=types.EmbedContentConfig(task_type="RETRIEVAL_QUERY"),
-    )
-    q_emb = np.array(resp.embeddings[0].values)
-    scores = np.dot(np.stack(dataframe["Embeddings"]), q_emb)
-    ordem = np.argsort(scores)[::-1][:top_k]
-
-    resultados = []
-    for i in ordem:
-        if scores[i] < threshold:
-            continue
-        resultados.append({
-            "Titulo":   dataframe.iloc[i]["Titulo"],
-            "Chunk_ID": dataframe.iloc[i]["Chunk_ID"],
-            "Conteudo": dataframe.iloc[i]["Conteudo"],
-            "Fontes":   list(dataframe.iloc[i]["Fontes"]),
-            "Score":    float(scores[i]),
-        })
-    return resultados
-
-
-# RESILIÊNCIA
-# Backoff exponencial + jitter para ServerError (503).
-def chamar_api_com_retentativa(funcao, *args, tentativas=5, base=2.0, cap=30.0, **kwargs):
-    for n in range(tentativas):
+def with_retry(func, *args, **kwargs):
+    for attempt in range(1, MAX_RETRIES + 1):
         try:
-            return funcao(*args, **kwargs)
-        except errors.ServerError:
-            if n == tentativas - 1:
+            return func(*args, **kwargs)
+        except errors.APIError as error:
+            if error.code not in TRANSIENT_ERROR_CODES or attempt == MAX_RETRIES:
                 raise
-            delay = min(cap, base * (2 ** n)) + random.uniform(0, 1)
+            delay = backoff_delay(attempt)
+            print(f"[Retry] Error {error.code}, retrying in {delay:.1f}s ({attempt}/{MAX_RETRIES})")
             time.sleep(delay)
 
 
-# SAFETY E PROMPT DO SISTEMA
-seguranca_config = [
-    types.SafetySetting(category=types.HarmCategory.HARM_CATEGORY_HARASSMENT,
-                        threshold=types.HarmBlockThreshold.BLOCK_MEDIUM_AND_ABOVE),
-    types.SafetySetting(category=types.HarmCategory.HARM_CATEGORY_HATE_SPEECH,
-                        threshold=types.HarmBlockThreshold.BLOCK_MEDIUM_AND_ABOVE),
-    types.SafetySetting(category=types.HarmCategory.HARM_CATEGORY_SEXUALLY_EXPLICIT,
-                        threshold=types.HarmBlockThreshold.BLOCK_MEDIUM_AND_ABOVE),
-    types.SafetySetting(category=types.HarmCategory.HARM_CATEGORY_DANGEROUS_CONTENT,
-                        threshold=types.HarmBlockThreshold.BLOCK_MEDIUM_AND_ABOVE),
+# MODELS
+
+
+actions_by_model = {m.name: (m.supported_actions or []) for m in client.models.list()}
+
+EMBEDDING_MODEL = next((m for m in EMBEDDING_MODELS if "embedContent" in actions_by_model.get(m, [])), None)
+ACTIVE_MODELS = [m.strip() for m in GENERATION_MODELS if "generateContent" in actions_by_model.get(m.strip(), [])]
+
+if not EMBEDDING_MODEL:
+    raise RuntimeError(f"None of {EMBEDDING_MODELS} is available for this API key.")
+if not ACTIVE_MODELS:
+    available = sorted(n for n, a in actions_by_model.items() if "generateContent" in a)
+    raise RuntimeError(f"None of GENERATION_MODELS is available. Models offered by the API: {available}")
+
+print(f"[Embedding model]   {EMBEDDING_MODEL}")
+print(f"[Generation models] {ACTIVE_MODELS}")
+
+
+# KNOWLEDGE BASE
+
+
+# 🧠 Knowledge base: corpus already split into chunks (id, titulo, texto, fonte, documento_origem)
+corpus = load_dataset(HF_DATASET, split="train").to_pandas()
+corpus["fontes"] = corpus["fonte"].apply(lambda s: [f.strip() for f in str(s).split(", ") if f.strip()])
+print(f"[Corpus] {len(corpus)} chunks loaded from {HF_DATASET}")
+
+
+# EMBEDDINGS AND INDEXING
+
+
+def embed_text(text, task_type, title=None):
+    response = with_retry(
+        client.models.embed_content,
+        model=EMBEDDING_MODEL,
+        contents=text,
+        config=types.EmbedContentConfig(task_type=task_type, title=title),  # 🧠 Asymmetric embedding: different task types for documents and queries
+    )
+    vector = np.asarray(response.embeddings[0].values, dtype=np.float32)
+    return vector / np.linalg.norm(vector)  # 🧠 L2 normalization: the dot product becomes cosine similarity
+
+
+EMBEDDING_MATRIX = np.stack([  # 🧠 Indexing: the corpus becomes a vector index (chunks x dimensions)
+    embed_text(row.texto, "RETRIEVAL_DOCUMENT", title=row.titulo)  # 🧠 The parent document title anchors each chunk semantically
+    for row in corpus.itertuples()
+])
+print(f"[Index] {EMBEDDING_MATRIX.shape[0]} vectors of {EMBEDDING_MATRIX.shape[1]} dimensions")
+
+
+# RETRIEVAL
+
+
+def retrieve_context(query):
+    scores = EMBEDDING_MATRIX @ embed_text(query, "RETRIEVAL_QUERY")  # 🧠 Vector search: compares the query with every chunk
+    ranking = np.argsort(scores)[::-1][:TOP_K]  # 🧠 Top-k retrieval: the most similar chunks first
+
+    print(f"[Retrieval] '{query}' -> " + ", ".join(f"{corpus.iloc[i]['id']}={scores[i]:.3f}" for i in ranking))
+
+    return [
+        {
+            "chunk_id": corpus.iloc[i]["id"],
+            "title": corpus.iloc[i]["titulo"],
+            "content": corpus.iloc[i]["texto"],
+            "sources": list(corpus.iloc[i]["fontes"]),
+            "score": float(scores[i]),
+        }
+        for i in ranking
+        if scores[i] >= SIMILARITY_THRESHOLD  # 🧠 Relevance threshold: discards unrelated context
+    ]
+
+
+# GENERATION SETTINGS
+
+
+SAFETY_SETTINGS = [  # 🧠 Safety filters: block harmful content with medium or high probability
+    types.SafetySetting(category=category, threshold=types.HarmBlockThreshold.BLOCK_MEDIUM_AND_ABOVE)
+    for category in (
+        types.HarmCategory.HARM_CATEGORY_HARASSMENT,
+        types.HarmCategory.HARM_CATEGORY_HATE_SPEECH,
+        types.HarmCategory.HARM_CATEGORY_SEXUALLY_EXPLICIT,
+        types.HarmCategory.HARM_CATEGORY_DANGEROUS_CONTENT,
+    )
 ]
 
-# RAG · generation — few-shot + grounding restritivo + regra de citação (só copia
-# do campo "Fontes:" do cabeçalho; nunca infere a partir do conteúdo).
-instrucao_sistema = """
+# 🧠 System instruction + few-shot prompting + restrictive grounding + citation rule (sources copied only from the "Fontes:" header)
+SYSTEM_INSTRUCTION = """
 Utilizando como base os exemplos de perguntas e respostas abaixo, responda à pergunta atual utilizando o texto base num formato organizado, separando as informações em tópicos para destaque, incluindo as fontes do texto base, mas sem adicionar informações que não fazem parte do texto base.
 
 REGRA DE CITAÇÃO DE FONTES (obrigatória):
@@ -219,125 +191,203 @@ EXEMPLO DE RESPOSTA 2:
 * **Fontes:** Secretaria Municipal de Saúde de Itabira, Prefeitura de Itabira.
 """
 
-config_geracao = types.GenerateContentConfig(
-    candidate_count=1, temperature=0.5, top_p=0.9, max_output_tokens=2048,
-    safety_settings=seguranca_config, system_instruction=instrucao_sistema,
+GENERATION_CONFIG = types.GenerateContentConfig(
+    temperature=0.5,  # 🧠 Temperature: controls randomness when choosing each token
+    top_p=0.9,  # 🧠 Nucleus sampling: samples only from tokens adding up to 90% probability
+    max_output_tokens=2048,
+    safety_settings=SAFETY_SETTINGS,
+    system_instruction=SYSTEM_INSTRUCTION,
+)
+
+REWRITE_CONFIG = types.GenerateContentConfig(
+    temperature=0.0,  # 🧠 Deterministic decoding: rewriting must be faithful, not creative
+    max_output_tokens=256,
+    safety_settings=SAFETY_SETTINGS,
 )
 
 
+# CONVERSATION HISTORY
+
+
+ALERT_PREFIXES = ("\n\n> ⚠️", "\n\n> ℹ️")
+
+
+def extract_text(content):
+    if isinstance(content, str):
+        return content
+    if isinstance(content, dict):
+        return content.get("text") or ""
+    if isinstance(content, (list, tuple)):
+        return " ".join(extract_text(part) for part in content)
+    return ""
+
+
+def convert_history(gradio_history):
+    messages = []
+    for item in gradio_history:
+        role, text = item.get("role"), extract_text(item.get("content")).strip()
+        for prefix in ALERT_PREFIXES:
+            text = text.split(prefix)[0]
+        if text and role in ("user", "assistant"):
+            messages.append(types.Content(
+                role="model" if role == "assistant" else "user",
+                parts=[types.Part(text=text)],
+            ))
+
+    messages = messages[-MAX_HISTORY_MESSAGES:]  # 🧠 Short-term memory: a sliding window caps the tokens sent
+    while messages and messages[0].role == "model":
+        messages.pop(0)
+    return messages
+
+
 # QUERY REWRITING
-# RAG · retrieval — reescreve a pergunta como consulta autocontida a partir do
-# histórico; fallback silencioso para a pergunta original em qualquer falha.
-def reformular_consulta(pergunta, historico_txt):
-    if not historico_txt:
-        return pergunta
-    contexto = "\n".join(historico_txt[-6:])
-    prompt = (
+
+
+def rewrite_query(question, history):
+    if not history:
+        return question
+
+    transcript = "\n".join(f"{m.role}: {m.parts[0].text}" for m in history)
+    prompt = (  # 🧠 Query rewriting: turns follow-ups ("e o telefone?") into self-contained search queries
         "Reescreva a NOVA PERGUNTA como uma consulta AUTOCONTIDA, "
         "substituindo pronomes e referências implícitas por termos explícitos. "
         "Responda APENAS a consulta reescrita.\n\n"
-        f"HISTÓRICO:\n{contexto}\n\nNOVA PERGUNTA: {pergunta}\n\nCONSULTA REESCRITA:"
+        f"HISTÓRICO:\n{transcript}\n\nNOVA PERGUNTA: {question}\n\nCONSULTA REESCRITA:"
     )
-    try:
-        resp = chamar_api_com_retentativa(
-            client.models.generate_content, model=model_name_geracao, contents=prompt,
-            config=types.GenerateContentConfig(
-                temperature=0.0, max_output_tokens=128, safety_settings=seguranca_config,
-            ),
-        )
-        return (resp.text or "").strip() or pergunta
-    except Exception:
-        return pergunta
+    for model in ACTIVE_MODELS:
+        try:
+            response = with_retry(client.models.generate_content, model=model, contents=prompt, config=REWRITE_CONFIG)
+            return (response.text or "").strip() or question
+        except errors.APIError as error:
+            if error.code not in TRANSIENT_ERROR_CODES | SKIP_MODEL_ERROR_CODES:
+                break
+    return question  # silent fallback: the original question still works for most cases
 
 
-# FAITHFULNESS
-# RAG · pós-geração — checagens ortogonais:
-#   (a) telefones: contra os chunks recuperados (o que o modelo viu);
-#   (b) fontes: contra o CONJUNTO de fontes dos documentos recuperados;
-#   (c) título citado como fonte: vira aviso, não erro.
-def verificar_faithfulness(resposta, contexto_chunks, fontes_esperadas, titulos_esperados):
-    alertas, avisos = [], []
+# GENERATION (STREAMING WITH MODEL FALLBACK)
 
-    tel_resp = set(re.findall(r"\b\d{4}-\d{4}\b", resposta))
-    tel_ctx  = set(re.findall(r"\b\d{4}-\d{4}\b", contexto_chunks))
-    orfaos = tel_resp - tel_ctx
-    if orfaos:
-        alertas.append(f"telefone(s) sem lastro nos chunks: {sorted(orfaos)}")
 
-    # Decompõe o bloco "A e B e C" em fontes individuais antes de comparar.
-    blocos = re.findall(r"Fontes?:?\s*\**\s*([^.\n]+)", resposta, re.I)
-    for bloco in blocos:
-        bloco = re.sub(r"\*+", "", bloco).strip()
-        for f in re.split(r"\s+e\s+|,|;", bloco):
-            f = f.strip().rstrip(".")
-            if len(f) < 8:
+def stream_answer(contents):
+    last_error = None
+    for model in ACTIVE_MODELS:
+        for attempt in range(1, MAX_RETRIES + 1):
+            partial = ""
+            try:
+                stream = client.models.generate_content_stream(  # 🧠 LLM inference: autoregressive generation streamed token by token
+                    model=model, contents=contents, config=GENERATION_CONFIG,
+                )
+                for chunk in stream:
+                    if chunk.text:
+                        partial += chunk.text
+                        yield partial
+                return
+            except errors.APIError as error:
+                last_error = error
+                if partial or error.code not in TRANSIENT_ERROR_CODES | SKIP_MODEL_ERROR_CODES:
+                    raise
+                if error.code in SKIP_MODEL_ERROR_CODES or attempt == MAX_RETRIES:
+                    break
+                time.sleep(backoff_delay(attempt))
+        print(f"[Fallback] {model} unavailable ({last_error.code}), trying the next model")
+    raise RuntimeError("All generation models are unavailable.") from last_error
+
+
+# FAITHFULNESS CHECK
+
+
+PHONE_PATTERN = r"\b\d{4}-\d{4}\b"
+
+
+def check_faithfulness(answer, context, expected_sources, expected_titles):  # 🧠 Faithfulness check: post-generation hallucination detection
+    alerts, notices = [], []
+
+    orphan_phones = set(re.findall(PHONE_PATTERN, answer)) - set(re.findall(PHONE_PATTERN, context))
+    if orphan_phones:
+        alerts.append(f"telefone(s) sem lastro no texto base: {sorted(orphan_phones)}")
+
+    for block in re.findall(r"Fontes?:?\s*\**\s*([^.\n]+)", answer, re.I):
+        block = re.sub(r"\*+", "", block).strip()
+        for source in re.split(r"\s+e\s+|,|;", block):
+            source = source.strip().rstrip(".")
+            if len(source) < 8 or "não informada" in source.lower():
                 continue
-
-            if any(f.lower() in t.lower() or t.lower() in f.lower()
-                   for t in titulos_esperados):
-                avisos.append(f"citou título como fonte: '{f[:60]}...'")
+            if any(source.lower() in t.lower() or t.lower() in source.lower() for t in expected_titles):
+                notices.append(f"título citado como fonte: '{source[:60]}'")
                 continue
-
-            if fontes_esperadas and not any(
-                f.lower() in fe.lower() or fe.lower() in f.lower()
-                for fe in fontes_esperadas
+            if expected_sources and not any(
+                source.lower() in s.lower() or s.lower() in source.lower() for s in expected_sources
             ):
-                alertas.append(f"fonte não corresponde aos documentos recuperados: '{f[:60]}...'")
+                alerts.append(f"fonte não corresponde aos documentos recuperados: '{source[:60]}'")
 
-    return alertas, avisos
+    return alerts, notices
 
 
-# INTERFACE GRADIO
-def chat_fn(message: str, history: list[dict]):
-    # RAG · retrieval — (0) reformula com base no histórico textual.
-    historico_txt = [f"{m['role']}: {m['content']}" for m in history[-6:]]
-    consulta = reformular_consulta(message, historico_txt)
+# CHAT ORCHESTRATION
 
-    # RAG · retrieval — (1) top-k + threshold; sem resultado, não chama o LLM.
-    resultados = recuperar_contexto(consulta)
-    if not resultados:
-        yield "Não encontrei informação relevante na base para responder com segurança."
+
+NO_CONTEXT_MESSAGE = (
+    "Não encontrei informação relevante na minha base para responder com segurança. "
+    "Posso responder sobre a Covid-19 (definição, sintomas, o que fazer, grupos de risco) "
+    "e sobre as unidades de saúde de Itabira por bairro."
+)
+EMPTY_ANSWER_MESSAGE = "Não foi possível gerar uma resposta para essa pergunta."
+ERROR_MESSAGE = "⚠️ O serviço está indisponível no momento. Tente novamente em alguns minutos."
+
+
+def chat_fn(message, history):
+    question = extract_text(message).strip()
+    if not question:
+        yield "Digite uma pergunta."
         return
 
-    # RAG · augmentation — (2) injeta fontes reais ao lado de cada documento.
-    contexto = "\n\n".join(
-        f"[Documento: {r['Titulo']} | Fontes: {', '.join(r['Fontes']) or 'não informada'} | Score: {r['Score']:.3f}]\n{r['Conteudo']}"
-        for r in resultados
-    )
-    prompt = f"PERGUNTA ATUAL: {message}\n\nTEXTO BASE:\n{contexto}"
+    try:
+        memory = convert_history(history)
+        query = rewrite_query(question, memory)
 
-    # RAG · generation — (3) chama o modelo com o prompt aumentado.
-    resposta = chamar_api_com_retentativa(
-        client.models.generate_content,
-        model=model_name_geracao, contents=prompt, config=config_geracao,
-    )
-    texto = resposta.text or ""
+        results = retrieve_context(query)  # 🧠 RAG, retrieval: finds the most relevant chunks
+        if not results:
+            yield NO_CONTEXT_MESSAGE  # without grounding the LLM is not called, which prevents hallucination
+            return
 
-    # RAG · pós-geração — (4) checagens de faithfulness.
-    titulos_esperados = list({r["Titulo"] for r in resultados})
-    fontes_esperadas  = sorted({f for r in resultados for f in r["Fontes"]})
-    alertas, avisos = verificar_faithfulness(
-        texto, contexto, fontes_esperadas, titulos_esperados,
-    )
-    if alertas:
-        texto += "\n\n> ⚠️ **Alerta de faithfulness:** " + "; ".join(alertas)
-    if avisos:
-        texto += "\n\n> ℹ️ " + "; ".join(avisos)
+        context = "\n\n".join(  # 🧠 RAG, augmentation: each chunk goes in with its real sources and score
+            f"[Documento: {r['title']} | Fontes: {', '.join(r['sources']) or 'não informada'} | Score: {r['score']:.3f}]\n{r['content']}"
+            for r in results
+        )
+        prompt = f"PERGUNTA ATUAL: {question}\n\nTEXTO BASE:\n{context}"
 
-    # Streaming token a token via yield.
-    parcial = ""
-    for token in texto.split():
-        parcial += token + " "
-        yield parcial
+        answer = ""
+        for answer in stream_answer(memory + [types.Content(role="user", parts=[types.Part(text=prompt)])]):  # 🧠 RAG, generation: memory + grounded prompt
+            yield answer
+        if not answer:
+            yield EMPTY_ANSWER_MESSAGE  # 🧠 Empty text means the safety filters blocked the answer
+            return
+
+        alerts, notices = check_faithfulness(
+            answer, context,
+            expected_sources=sorted({s for r in results for s in r["sources"]}),
+            expected_titles=list({r["title"] for r in results}),
+        )
+        if alerts:
+            answer += "\n\n> ⚠️ **Alerta de fidelidade:** " + "; ".join(alerts)
+        if notices:
+            answer += "\n\n> ℹ️ " + "; ".join(notices)
+        yield answer
+
+    except Exception as error:
+        print(f"[Error] {type(error).__name__}: {error}")
+        yield ERROR_MESSAGE
 
 
-demo = gr.ChatInterface(
+# USER INTERFACE
+
+
+demo = gr.ChatInterface(  # 🧠 Conversational interface: keeps the history and feeds it to the RAG pipeline on every turn
     fn=chat_fn,
-    title="Assistente RAG — Saúde Pública (Itabira)",
+    title="🩺 Assistente RAG — Saúde Pública (Itabira/MG)",
     description=(
-        "Protótipo de chatbot com RAG sobre dados de COVID-19 e unidades de "
-        "saúde de Itabira. As respostas são fundamentadas apenas no texto base "
-        "recuperado. **Não utilizar para decisões clínicas.**"
+        "Protótipo de chatbot com RAG sobre a Covid-19 e as unidades de saúde de Itabira. "
+        "As respostas são fundamentadas apenas no texto base recuperado de fontes oficiais.<br>"
+        "⚠️ <b>Não utilize para decisões clínicas.</b> Em caso de sintomas, procure uma unidade de saúde."
     ),
     examples=[
         "O que é a COVID-19?",
@@ -347,9 +397,8 @@ demo = gr.ChatInterface(
         "Quais UBS ficam no bairro São Bento?",
         "Qual o telefone da UBS Bethânia?",
     ],
-    theme="soft",
-    api_name="chat",
+    cache_examples=False,
 )
 
 if __name__ == "__main__":
-    demo.launch()
+    demo.launch(theme=gr.themes.Soft())
